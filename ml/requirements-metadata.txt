@@ -1,0 +1,4 @@
+# Keep metadata writing isolated because tflite-support has strict ABI/wheel constraints.
+# tflite-support 0.4.4 has no native Windows wheel; install this in WSL/Linux.
+numpy>=1.20,<2
+tflite-support==0.4.4

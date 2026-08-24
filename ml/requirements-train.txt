@@ -1,0 +1,4 @@
+# Use Python 3.11. Native Windows TensorFlow is CPU-only; use WSL2 or Colab for GPU training.
+tensorflow>=2.18,<2.21
+numpy>=1.26,<2.2
+pillow>=10,<13

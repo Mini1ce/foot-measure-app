@@ -1,0 +1,5 @@
+# FootNet v1.0, Zenodo record 20457253
+# https://zenodo.org/records/20457253
+size-bytes 556662306 FootNet_v1.0.zip
+md5 d3a756d30e2051115c13f044558754a6 FootNet_v1.0.zip
+sha256 3c1bfe4a037f60925325421d467e2310bf65a9c8b2485314a0069b6bbe579b07 FootNet_v1.0.zip
