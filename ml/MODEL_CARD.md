@@ -34,6 +34,24 @@ FootNet transformations must be disclosed: source metadata is removed during
 normalization, masks are converted to binary PNG, and the single pinned source
 image `righttop_004.jpg` is rotated clockwise to match its publisher mask.
 
+### SynFoot V2 candidate pipeline (not yet a model release)
+
+The repository now contains a reproducible path for SynFoot V2 pretraining,
+followed by the same real-image FootNet fine-tuning stages. The local V2 set has
+100,000 renders but only eight underlying `foot-id` scan groups. Its separate
+`pretrain_split` holds out whole scan groups (six train, two validation), uses
+the raw antialiased-mask threshold `>=128`, and can filter to non-cropped camera
+views within 25° or 35° of vertical. Synthetic shape coefficients are retained
+as provenance and are **not** interpreted as millimetres. Exact duplicate RGB
+records are excluded from pretraining, selected package assets are checksum
+verified, and candidate runs carry dataset/source/checkpoint fingerprints in a
+separate provenance document.
+
+No SynFoot-trained weights or metrics are recorded in this model card yet. A
+candidate must outperform this bundled FootNet-only baseline on the fixed real
+evaluation set, pass Keras/TFLite/browser parity, and then pass real-phone
+millimetre tests before replacing the deployed model.
+
 ## Evaluation
 
 Record results separately for real dorsal images and any synthetic data.
@@ -51,6 +69,15 @@ Record results separately for real dorsal images and any synthetic data.
 
 Threshold selection set and rationale: `0.5`, selected on the validation split
 before the 11-image dorsal test split was evaluated.
+
+The table above is a historical result from the earlier global-silhouette
+geometry evaluator. The current evaluator uses versioned
+`heel-to-toe-cross-sections-v1` geometry, reports target-ineligible masks
+separately from prediction failures, and must not be compared numerically with
+that table until the same checkpoint is rerun. The current FootNet dorsal audit
+contains 69 images: 36 touch an image border and 3 do not yield valid
+measurement geometry. These are review findings, not model-accuracy results;
+human include/exclude decisions remain pending.
 
 Keras/TFLite parity result and golden-set hash: export validation confirmed the
 model tensors and FP16 TFLite artifact; a fixed browser golden-set parity test

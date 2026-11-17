@@ -112,6 +112,118 @@ class CliEncodingTests(unittest.TestCase):
         )
         self.assertTrue(args.allow_unresolved_eval)
 
+    def test_pretrain_and_package_commands_expose_reproducibility_options(self) -> None:
+        pretrain = _parser().parse_args(
+            [
+                "pretrain-split",
+                "samples.jsonl",
+                "--output",
+                "samples.pretrain.jsonl",
+                "--lock",
+                "pretrain.lock.json",
+            ]
+        )
+        self.assertEqual(pretrain.train_ratio, 0.75)
+        package = _parser().parse_args(
+            [
+                "package-pretrain",
+                "samples.pretrain.jsonl",
+                "--output-dir",
+                "package",
+            ]
+        )
+        self.assertEqual(package.subset, "measurement-top35")
+        self.assertGreater(package.train_limit, package.validation_limit)
+
+    def test_measurement_review_commands_expose_safe_defaults(self) -> None:
+        audit = _parser().parse_args(
+            ["measurement-audit", "samples.jsonl", "--output-dir", "audit"]
+        )
+        self.assertEqual(audit.views, ["dorsal"])
+        self.assertEqual(audit.splits, ["train", "val", "test"])
+        reviewed = _parser().parse_args(
+            [
+                "measurement-filter",
+                "samples.jsonl",
+                "--review",
+                "review.csv",
+                "--output",
+                "samples.reviewed.jsonl",
+                "--lock",
+                "samples.reviewed.lock.json",
+            ]
+        )
+        self.assertEqual(reviewed.review, Path("review.csv"))
+
+    def test_package_rejects_nonfinite_or_nonpositive_shard_size_cleanly(self) -> None:
+        for value in ("nan", "inf", "0", "-1"):
+            with self.subTest(value=value):
+                errors = io.StringIO()
+                with patch.object(sys, "stderr", errors):
+                    result = main(
+                        [
+                            "package-pretrain",
+                            "missing.jsonl",
+                            "--output-dir",
+                            "package",
+                            "--shard-gib",
+                            value,
+                        ]
+                    )
+                self.assertEqual(result, 2)
+                self.assertIn("--shard-gib", errors.getvalue())
+
+    def test_synfoot_v2_in_place_flag_is_explicit(self) -> None:
+        args = _parser().parse_args(
+            [
+                "import",
+                "synfoot-v2",
+                "--input-dir",
+                "dataset",
+                "--output-root",
+                "dataset",
+                "--in-place",
+            ]
+        )
+        self.assertTrue(args.in_place)
+
+    def test_in_place_rejects_archives_and_other_sources_before_import(self) -> None:
+        cases = (
+            (
+                [
+                    "import",
+                    "synfoot-v2",
+                    "--archive",
+                    "missing.zip",
+                    "--output-root",
+                    "dataset",
+                    "--in-place",
+                    "--accept-license",
+                ],
+                "requires --input-dir",
+            ),
+            (
+                [
+                    "import",
+                    "footnet",
+                    "--input-dir",
+                    "dataset",
+                    "--output-root",
+                    "dataset",
+                    "--in-place",
+                    "--accept-license",
+                ],
+                "only for synfoot-v2",
+            ),
+        )
+        for arguments, expected in cases:
+            with self.subTest(expected=expected):
+                errors = io.StringIO()
+                with patch.object(sys, "stderr", errors):
+                    result = main(arguments)
+                self.assertEqual(result, 2)
+                self.assertIn(expected, errors.getvalue())
+
     def test_error_output_uses_backslash_escape_on_legacy_console(self) -> None:
         raw = io.BytesIO()
         stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")

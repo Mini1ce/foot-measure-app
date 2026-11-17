@@ -42,6 +42,39 @@ def _write_mask(
     Image.fromarray(pixels, mode="L").save(path)
 
 
+def _write_rgba_image(
+    path: Path,
+    colour: tuple[int, int, int, int] = (90, 100, 110, 255),
+    size: tuple[int, int] = (48, 64),
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pixels = np.zeros((size[1], size[0], 4), dtype=np.uint8)
+    pixels[:, :] = colour
+    Image.fromarray(pixels, mode="RGBA").save(path)
+
+
+def _write_synfoot_v2_label(
+    path: Path,
+    *,
+    foot_id: object = "0009-A",
+    camera_position: object = (1.0, 0.0, 1.0),
+    camera_look_at: object = (0.0, 0.0, 0.0),
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "foot-id": foot_id,
+                "camera_position": camera_position,
+                "camera_look_at": camera_look_at,
+                "foot_poses": {"Dorsiflexion": 0.25},
+                "foot_shape": {"Length": 0.75},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 class ImporterTests(unittest.TestCase):
     def _make_footnet(self, root: Path) -> None:
         samples = (
@@ -219,6 +252,186 @@ class ImporterTests(unittest.TestCase):
                     for record in result.records
                 )
             )
+
+    def test_synfoot_v2_in_place_indexes_nested_layout_without_copying_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Synfoot"
+            for index, camera_position in enumerate(
+                ((1.0, 0.0, 1.0), (0.0, 1.0, 2.0), (0.0, 0.0, 2.0))
+            ):
+                stem = f"{index:06d}"
+                _write_rgba_image(root / "rgb" / "rgb" / f"{stem}.png")
+                _write_mask(root / "mask" / "mask" / f"{stem}.png", antialiased=True)
+                _write_synfoot_v2_label(
+                    root / "labels" / "labels_processed" / f"{stem}.json",
+                    camera_position=camera_position,
+                )
+
+            apple_double = (
+                root / "labels" / "__MACOSX" / "labels_processed" / "._000000.json"
+            )
+            apple_double.parent.mkdir(parents=True)
+            apple_double.write_bytes(b"\xff\xfeAppleDouble")
+
+            result = import_dataset(
+                "synfoot-v2",
+                root,
+                root,
+                license_accepted=True,
+                in_place=True,
+            )
+
+            self.assertEqual(result.errors, [])
+            self.assertEqual(len(result.records), 3)
+            self.assertFalse((root / "images").exists())
+            self.assertFalse((root / "masks").exists())
+            self.assertTrue(result.manifest_path.is_file())
+            self.assertTrue(result.lock_path.is_file())
+            self.assertEqual(len({record["group_id"] for record in result.records}), 1)
+
+            first, second, third = result.records
+            self.assertEqual(first["image_path"], "rgb/rgb/000000.png")
+            self.assertEqual(first["mask_path"], "mask/mask/000000.png")
+            self.assertEqual(
+                first["provenance"]["original_label_path"],
+                "labels/labels_processed/000000.json",
+            )
+            self.assertEqual(first["label_path"], "labels/labels_processed/000000.json")
+            self.assertEqual(
+                first["label_sha256"],
+                first["provenance"]["original_label_sha256"],
+            )
+            self.assertEqual(first["preprocessing"]["source_image_mode"], "RGBA")
+            self.assertEqual(first["preprocessing"]["mask_foreground_threshold_gte"], 128)
+            self.assertEqual(first["foot_poses"], {"Dorsiflexion": 0.25})
+            self.assertEqual(first["foot_shape_coefficients"], {"Length": 0.75})
+            self.assertEqual(first["qa"]["foreground_pixels"], 42 * 19)
+            self.assertTrue(first["qa"]["geometry_eligible"])
+            self.assertAlmostEqual(first["camera"]["tilt_from_vertical_deg"], 45.0)
+            self.assertAlmostEqual(first["camera"]["tilt_deg"], 45.0)
+            self.assertAlmostEqual(first["camera"]["azimuth_deg"], 0.0)
+            self.assertEqual(first["subsets"], ["segmentation-valid"])
+            self.assertAlmostEqual(
+                second["camera"]["tilt_from_vertical_deg"],
+                26.565051177,
+            )
+            self.assertAlmostEqual(second["camera"]["azimuth_deg"], 90.0)
+            self.assertEqual(
+                second["subsets"],
+                ["segmentation-valid", "measurement-top35"],
+            )
+            self.assertEqual(
+                third["subsets"],
+                ["segmentation-valid", "measurement-top35", "measurement-top25"],
+            )
+
+            loaded = read_manifest(result.manifest_path)
+            report = validate_manifest(loaded, data_root=root, verify_hashes=True)
+            self.assertTrue(report["valid"], report["errors"])
+            lock = json.loads(result.lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(lock["acquisition"]["kind"], "local-directory-in-place")
+            self.assertIn(
+                "not physical dimensions",
+                lock["metadata_notes"]["foot_shape_coefficients"],
+            )
+
+    def test_synfoot_v2_in_place_supports_flat_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Synfoot"
+            _write_image(root / "rgb" / "000000.png", (10, 20, 30))
+            threshold_mask = np.zeros((64, 48), dtype=np.uint8)
+            threshold_mask[12:33, 15:34] = 127
+            threshold_mask[33:64, 15:34] = 128
+            mask_path = root / "mask" / "000000.png"
+            mask_path.parent.mkdir(parents=True)
+            Image.fromarray(threshold_mask, mode="L").save(mask_path)
+            _write_synfoot_v2_label(root / "labels_processed" / "000000.json")
+
+            result = import_dataset(
+                "synfoot-v2", root, root, license_accepted=True, in_place=True
+            )
+
+            self.assertEqual(result.errors, [])
+            self.assertEqual(len(result.records), 1)
+            self.assertEqual(result.records[0]["image_path"], "rgb/000000.png")
+            self.assertEqual(result.records[0]["mask_path"], "mask/000000.png")
+            self.assertEqual(result.records[0]["qa"]["foreground_pixels"], 31 * 19)
+            self.assertTrue(result.records[0]["qa"]["touches_border"])
+            self.assertFalse(result.records[0]["qa"]["geometry_eligible"])
+            self.assertEqual(result.records[0]["subsets"], ["segmentation-valid"])
+
+    def test_synfoot_v2_fragmented_mask_is_not_geometry_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Synfoot"
+            _write_image(root / "rgb" / "000000.png", (10, 20, 30))
+            pixels = np.zeros((64, 48), dtype=np.uint8)
+            pixels[10:20, 5:15] = 255
+            pixels[35:45, 30:40] = 255
+            mask_path = root / "mask" / "000000.png"
+            mask_path.parent.mkdir(parents=True)
+            Image.fromarray(pixels, mode="L").save(mask_path)
+            _write_synfoot_v2_label(root / "labels_processed" / "000000.json")
+
+            result = import_dataset(
+                "synfoot-v2", root, root, license_accepted=True, in_place=True
+            )
+
+            record = result.records[0]
+            self.assertTrue(record["qa"]["valid"])
+            self.assertIn("fragmented_mask", record["qa"]["flags"])
+            self.assertFalse(record["qa"]["geometry_eligible"])
+            self.assertEqual(record["subsets"], ["segmentation-valid"])
+
+    def test_synfoot_v2_in_place_rejects_invalid_label_and_camera_metadata(self) -> None:
+        cases = (
+            ({"foot_id": ""}, "non-empty string foot-id"),
+            ({"camera_position": (0.0, 1.0)}, "three-number camera_position"),
+            (
+                {"camera_position": (0.0, 0.0, float("nan"))},
+                "non-finite camera_position",
+            ),
+            (
+                {"camera_position": (0.0, 0.0, -1.0)},
+                "camera_position must be above camera_look_at",
+            ),
+            (
+                {"camera_position": (0.0, 0.0, 0.0)},
+                "camera_position and camera_look_at must differ",
+            ),
+        )
+        for options, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "Synfoot"
+                _write_image(root / "rgb" / "000000.png", (10, 20, 30))
+                _write_mask(root / "mask" / "000000.png")
+                _write_synfoot_v2_label(
+                    root / "labels_processed" / "000000.json",
+                    **options,
+                )
+
+                result = import_dataset(
+                    "synfoot-v2", root, root, license_accepted=True, in_place=True
+                )
+
+                self.assertEqual(result.records, [])
+                self.assertTrue(any(expected in error for error in result.errors))
+
+    def test_synfoot_v2_in_place_rejects_other_sources_and_output_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "source"
+            root.mkdir()
+            with self.assertRaisesRegex(FootDataError, "only for synfoot-v2"):
+                import_dataset(
+                    "footnet", root, root, license_accepted=True, in_place=True
+                )
+            with self.assertRaisesRegex(FootDataError, "equal --input-dir"):
+                import_dataset(
+                    "synfoot-v2",
+                    root,
+                    root.parent / "processed",
+                    license_accepted=True,
+                    in_place=True,
+                )
 
     def test_real_footnet_layout_keeps_naming_map_as_unresolved_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -11,6 +12,19 @@ from .archive import ArchiveLimits, safe_extract_zip
 from .errors import FootDataError
 from .importers import import_archive, import_dataset
 from .manifest import read_manifest, validate_manifest, write_manifest
+from .measurement_audit import (
+    MeasurementAuditPolicy,
+    build_measurement_audit,
+    write_reviewed_manifest,
+)
+from .package import (
+    DEFAULT_SHARD_SIZE_BYTES,
+    DEFAULT_TRAIN_LIMIT,
+    DEFAULT_VALIDATION_LIMIT,
+    export_pretrain_package,
+)
+from .pretrain import split_synfoot_pretraining
+from .report import summarize_synfoot
 from .sources import SOURCES, list_sources
 from .split import SplitRatios, split_records
 
@@ -48,6 +62,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     importer.add_argument("--expected-sha256")
     importer.add_argument("--accept-license", action="store_true")
+    importer.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Index an extracted SynFoot V2 directory without copying its assets",
+    )
 
     validate = commands.add_parser("validate", help="Validate manifest structure and leakage")
     validate.add_argument("manifest", type=Path)
@@ -75,6 +94,59 @@ def _parser() -> argparse.ArgumentParser:
             "sample-only, and pin this weaker policy in the split lock"
         ),
     )
+
+    pretrain = commands.add_parser(
+        "pretrain-split",
+        help="Create a group-safe synthetic train/validation field without a test split",
+    )
+    pretrain.add_argument("manifest", type=Path)
+    pretrain.add_argument("--output", type=Path, required=True)
+    pretrain.add_argument("--lock", type=Path, required=True)
+    pretrain.add_argument("--seed", type=int, default=20260825)
+    pretrain.add_argument("--train-ratio", type=float, default=0.75)
+
+    package = commands.add_parser(
+        "package-pretrain",
+        help="Create deterministic upload-friendly ZIP shards from a pretrain manifest",
+    )
+    package.add_argument("manifest", type=Path)
+    package.add_argument("--output-dir", type=Path, required=True)
+    package.add_argument("--subset", default="measurement-top35")
+    package.add_argument("--train-limit", type=int, default=DEFAULT_TRAIN_LIMIT)
+    package.add_argument(
+        "--validation-limit", type=int, default=DEFAULT_VALIDATION_LIMIT
+    )
+    package.add_argument(
+        "--shard-gib",
+        type=float,
+        default=DEFAULT_SHARD_SIZE_BYTES / 1024**3,
+    )
+
+    summarize = commands.add_parser(
+        "summarize",
+        help="Report SynFoot group, camera-angle, subset, and QA coverage",
+    )
+    summarize.add_argument("manifest", type=Path)
+
+    audit = commands.add_parser(
+        "measurement-audit",
+        help="Generate a visual report for explicit measurement-mask review",
+    )
+    audit.add_argument("manifest", type=Path)
+    audit.add_argument("--data-root", type=Path)
+    audit.add_argument("--output-dir", type=Path, required=True)
+    audit.add_argument("--views", nargs="*", default=["dorsal"])
+    audit.add_argument("--splits", nargs="*", default=["train", "val", "test"])
+    audit.add_argument("--thumbnail-size", type=int, default=320)
+
+    reviewed = commands.add_parser(
+        "measurement-filter",
+        help="Create a manifest from explicit include/exclude review decisions",
+    )
+    reviewed.add_argument("manifest", type=Path)
+    reviewed.add_argument("--review", type=Path, required=True)
+    reviewed.add_argument("--output", type=Path, required=True)
+    reviewed.add_argument("--lock", type=Path, required=True)
     return parser
 
 
@@ -115,7 +187,12 @@ def main(argv: list[str] | None = None) -> int:
                 "group_overrides": args.group_overrides,
                 "group_regex": args.group_regex,
                 "license_accepted": args.accept_license,
+                "in_place": args.in_place,
             }
+            if args.in_place and args.source != "synfoot-v2":
+                raise FootDataError("--in-place is supported only for synfoot-v2")
+            if args.in_place and args.archive:
+                raise FootDataError("--in-place requires --input-dir and cannot import an archive")
             if args.archive:
                 result = import_archive(
                     args.source,
@@ -189,6 +266,103 @@ def main(argv: list[str] | None = None) -> int:
                     "summary": summary,
                 }
             )
+            return 0
+
+        if args.command == "pretrain-split":
+            manifest_path = args.manifest.resolve()
+            output_path = args.output.resolve()
+            lock_path = args.lock.resolve()
+            if len({manifest_path, output_path, lock_path}) != 3:
+                raise FootDataError(
+                    "Pretrain input, output, and lock must use three different paths"
+                )
+            if output_path.parent != manifest_path.parent:
+                raise FootDataError(
+                    "Pretrain output must be directly beside the input manifest so "
+                    f"relative asset paths keep the same base: {output_path}"
+                )
+            if lock_path.parent != manifest_path.parent:
+                raise FootDataError(
+                    "Pretrain lock must be directly beside the input manifest: "
+                    f"{lock_path}"
+                )
+            records, _, summary = split_synfoot_pretraining(
+                read_manifest(manifest_path),
+                seed=args.seed,
+                train_ratio=args.train_ratio,
+                lock_path=lock_path,
+            )
+            write_manifest(records, output_path)
+            _print_json(
+                {
+                    "manifest": str(output_path),
+                    "lock": str(lock_path),
+                    "summary": summary,
+                }
+            )
+            return 0
+
+        if args.command == "package-pretrain":
+            if not math.isfinite(args.shard_gib) or args.shard_gib <= 0:
+                raise FootDataError("--shard-gib must be finite and greater than zero")
+            result = export_pretrain_package(
+                args.manifest,
+                args.output_dir,
+                subset=args.subset,
+                train_limit=args.train_limit,
+                validation_limit=args.validation_limit,
+                shard_size_bytes=int(args.shard_gib * 1024**3),
+            )
+            _print_json(
+                {
+                    "output_directory": str(result.output_directory),
+                    "manifest": str(result.manifest_path),
+                    "lock": str(result.lock_path),
+                    "shards": [str(path) for path in result.shard_paths],
+                    "train_records": result.train_count,
+                    "validation_records": result.validation_count,
+                }
+            )
+            return 0
+
+        if args.command == "summarize":
+            _print_json(summarize_synfoot(read_manifest(args.manifest)))
+            return 0
+
+        if args.command == "measurement-audit":
+            data_root = args.data_root or args.manifest.parent
+            result = build_measurement_audit(
+                read_manifest(args.manifest),
+                data_root=data_root,
+                output_directory=args.output_dir,
+                views=set(args.views) if args.views else None,
+                splits=set(args.splits) if args.splits else None,
+                policy=MeasurementAuditPolicy(thumbnail_size=args.thumbnail_size),
+            )
+            _print_json(result)
+            return 0
+
+        if args.command == "measurement-filter":
+            manifest_path = args.manifest.resolve()
+            review_path = args.review.resolve()
+            output_path = args.output.resolve()
+            lock_path = args.lock.resolve()
+            if len({manifest_path, review_path, output_path, lock_path}) != 4:
+                raise FootDataError(
+                    "Input manifest, review CSV, output manifest, and lock require distinct paths"
+                )
+            if output_path.parent != manifest_path.parent or lock_path.parent != manifest_path.parent:
+                raise FootDataError(
+                    "Reviewed output and lock must be directly beside the input manifest"
+                )
+            result = write_reviewed_manifest(
+                read_manifest(manifest_path),
+                input_manifest=manifest_path,
+                review_csv=review_path,
+                output_manifest=output_path,
+                lock_path=lock_path,
+            )
+            _print_json(result)
             return 0
     except (FootDataError, OSError, UnicodeError, json.JSONDecodeError) as error:
         _print_error(error)

@@ -24,12 +24,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_CONFIG.learning_rate)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_CONFIG.weight_decay)
     parser.add_argument("--seed", type=int, default=DEFAULT_CONFIG.seed)
+    parser.add_argument(
+        "--split-field",
+        choices=("split", "pretrain_split"),
+        default="split",
+        help="Manifest field used for train/val assignment",
+    )
     parser.add_argument("--views", nargs="*", help="Optional manifest views, e.g. dorsal")
     parser.add_argument("--sources", nargs="*", help="Optional source IDs")
+    parser.add_argument("--subsets", nargs="*", help="Optional manifest subset tags")
+    parser.add_argument(
+        "--train-max-samples",
+        type=int,
+        help="Deterministically cap matching training samples",
+    )
+    parser.add_argument(
+        "--validation-max-samples",
+        type=int,
+        help="Deterministically cap matching validation samples",
+    )
     parser.add_argument("--real-only", action="store_true")
     parser.add_argument("--initial-model", type=Path)
     parser.add_argument("--no-imagenet", action="store_true")
     parser.add_argument("--freeze-encoder", action="store_true")
+    parser.add_argument(
+        "--geometry-augmentation",
+        action="store_true",
+        help="Enable paired rotation, scale, and translation augmentation",
+    )
     return parser.parse_args()
 
 
@@ -51,16 +73,35 @@ def main() -> int:
     filters = {
         "views": set(args.views) if args.views else None,
         "sources": set(args.sources) if args.sources else None,
+        "subsets": set(args.subsets) if args.subsets else None,
         "synthetic": False if args.real_only else None,
     }
-    train_records = load_manifest_records(args.manifest, "train", **filters)
-    validation_records = load_manifest_records(args.manifest, "val", **filters)
+    try:
+        train_records = load_manifest_records(
+            args.manifest,
+            "train",
+            max_samples=args.train_max_samples,
+            sample_seed=args.seed,
+            split_field=args.split_field,
+            **filters,
+        )
+        validation_records = load_manifest_records(
+            args.manifest,
+            "val",
+            max_samples=args.validation_max_samples,
+            sample_seed=args.seed,
+            split_field=args.split_field,
+            **filters,
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     train_dataset = make_dataset(
         train_records,
         image_size=args.image_size,
         batch_size=args.batch_size,
         training=True,
         seed=args.seed,
+        geometry_augmentation=args.geometry_augmentation,
     )
     validation_dataset = make_dataset(
         validation_records,
@@ -142,6 +183,10 @@ def main() -> int:
                 "image_size": args.image_size,
                 "batch_size": args.batch_size,
                 "seed": args.seed,
+                "split_field": args.split_field,
+                "train_max_samples": args.train_max_samples,
+                "validation_max_samples": args.validation_max_samples,
+                "geometry_augmentation": args.geometry_augmentation,
                 "filters": {key: sorted(value) if isinstance(value, set) else value for key, value in filters.items()},
                 "history": history.history,
             },

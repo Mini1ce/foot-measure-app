@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -33,6 +34,7 @@ REQUIRED_FIELDS = {
 }
 ALLOWED_SPLITS = {None, "train", "val", "test", "excluded"}
 ALLOWED_SPLIT_RELIABILITY = {None, "sample-only"}
+ALLOWED_PRETRAIN_SPLITS = {None, "train", "val", "excluded"}
 SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
@@ -125,7 +127,9 @@ def validate_manifest(
     sample_ids: set[str] = set()
     asset_paths: dict[str, tuple[str, str]] = {}
     group_splits: dict[str, str] = {}
+    pretrain_group_splits: dict[str, str] = {}
     hash_splits: dict[str, str] = {}
+    pretrain_hash_splits: dict[str, str] = {}
     sample_only_eval_counts = {"val": 0, "test": 0}
 
     for index, record in enumerate(materialized, start=1):
@@ -169,6 +173,20 @@ def validate_manifest(
             warnings.append(f"{sample_id}: invalid QA record is assigned to {split}")
         if record.get("synthetic") is True and split in {"val", "test"}:
             errors.append(f"{sample_id}: synthetic samples cannot be in {split}")
+        pretrain_split = record.get("pretrain_split")
+        if pretrain_split not in ALLOWED_PRETRAIN_SPLITS:
+            errors.append(f"{sample_id}: unsupported pretrain_split {pretrain_split!r}")
+        if pretrain_split in {"train", "val"}:
+            if record.get("synthetic") is not True:
+                errors.append(f"{sample_id}: pretrain_split requires synthetic data")
+            if split != "train":
+                errors.append(
+                    f"{sample_id}: synthetic pretraining must keep the main split as train"
+                )
+            if record.get("group_resolved") is not True:
+                errors.append(f"{sample_id}: pretrain_split requires a resolved group")
+            if qa_valid is not True:
+                errors.append(f"{sample_id}: invalid QA record cannot be used for pretraining")
         reliability = record.get("split_reliability")
         if reliability not in ALLOWED_SPLIT_RELIABILITY:
             errors.append(f"{sample_id}: unsupported split_reliability {reliability!r}")
@@ -189,6 +207,15 @@ def validate_manifest(
                 errors.append(
                     f"group leakage: {group_id!r} appears in {previous_split} and {split}"
                 )
+        if isinstance(group_id, str) and group_id and pretrain_split in {"train", "val"}:
+            previous_pretrain_split = pretrain_group_splits.setdefault(
+                group_id, pretrain_split
+            )
+            if previous_pretrain_split != pretrain_split:
+                errors.append(
+                    f"pretrain group leakage: {group_id!r} appears in "
+                    f"{previous_pretrain_split} and {pretrain_split}"
+                )
 
         image_hash = record.get("image_sha256")
         if not _is_sha256(image_hash):
@@ -201,11 +228,34 @@ def validate_manifest(
                     f"duplicate-image leakage: {normalized_image_hash[:12]} appears in "
                     f"{previous_split} and {split}"
                 )
+        if _is_sha256(image_hash) and pretrain_split in {"train", "val"}:
+            normalized_image_hash = image_hash.casefold()
+            previous_pretrain_split = pretrain_hash_splits.setdefault(
+                normalized_image_hash, pretrain_split
+            )
+            if previous_pretrain_split != pretrain_split:
+                errors.append(
+                    "pretrain duplicate-image leakage: "
+                    f"{normalized_image_hash[:12]} appears in "
+                    f"{previous_pretrain_split} and {pretrain_split}"
+                )
         mask_hash = record.get("mask_sha256")
         if not _is_sha256(mask_hash):
             errors.append(f"{sample_id}: mask_sha256 must be a SHA-256 hex digest")
 
-        for field in ("image_path", "mask_path"):
+        has_label_path = "label_path" in record
+        has_label_hash = "label_sha256" in record
+        if has_label_path != has_label_hash:
+            errors.append(
+                f"{sample_id}: label_path and label_sha256 must be provided together"
+            )
+        if has_label_hash and not _is_sha256(record.get("label_sha256")):
+            errors.append(f"{sample_id}: label_sha256 must be a SHA-256 hex digest")
+
+        asset_fields = ["image_path", "mask_path"]
+        if has_label_path:
+            asset_fields.append("label_path")
+        for field in asset_fields:
             path_error = _validate_relative_path(record.get(field), field, sample_id)
             if path_error:
                 errors.append(path_error)
@@ -232,9 +282,76 @@ def validate_manifest(
                 elif not resolved.is_file():
                     errors.append(f"{sample_id}: missing {field}: {relative_path}")
                 elif verify_hashes:
-                    expected = record[f"{'image' if field == 'image_path' else 'mask'}_sha256"]
+                    role = field.removesuffix("_path")
+                    expected = record.get(f"{role}_sha256")
+                    if not _is_sha256(expected):
+                        continue
                     if sha256_file(resolved).casefold() != str(expected).casefold():
                         errors.append(f"{sample_id}: checksum mismatch for {relative_path}")
+
+        subsets = record.get("subsets")
+        if subsets is not None:
+            if (
+                not isinstance(subsets, list)
+                or any(not isinstance(tag, str) or not tag for tag in subsets)
+                or len(subsets) != len(set(subsets))
+            ):
+                errors.append(f"{sample_id}: subsets must be a unique list of strings")
+            else:
+                subset_set = set(subsets)
+                if "measurement-top25" in subset_set and "measurement-top35" not in subset_set:
+                    errors.append(
+                        f"{sample_id}: measurement-top25 must also be measurement-top35"
+                    )
+                if subset_set & {"measurement-top25", "measurement-top35"} and (
+                    "segmentation-valid" not in subset_set
+                ):
+                    errors.append(
+                        f"{sample_id}: measurement subsets require segmentation-valid"
+                    )
+                geometry_eligible = qa.get("geometry_eligible") if isinstance(qa, dict) else None
+                if not isinstance(geometry_eligible, bool):
+                    errors.append(f"{sample_id}: qa.geometry_eligible must be boolean")
+                if "segmentation-valid" in subset_set and qa_valid is not True:
+                    errors.append(
+                        f"{sample_id}: segmentation-valid requires qa.valid=true"
+                    )
+                if subset_set & {"measurement-top25", "measurement-top35"} and (
+                    geometry_eligible is not True
+                ):
+                    errors.append(
+                        f"{sample_id}: measurement subsets require geometry eligibility"
+                    )
+                if geometry_eligible is True and isinstance(qa, dict):
+                    flags = qa.get("flags", [])
+                    if qa.get("touches_border") is True or (
+                        isinstance(flags, list) and "fragmented_mask" in flags
+                    ):
+                        errors.append(
+                            f"{sample_id}: border or fragmented masks cannot be geometry eligible"
+                        )
+
+                camera = record.get("camera")
+                if subset_set & {"measurement-top25", "measurement-top35"}:
+                    tilt = camera.get("tilt_deg") if isinstance(camera, dict) else None
+                    if (
+                        not isinstance(tilt, (int, float))
+                        or isinstance(tilt, bool)
+                        or not math.isfinite(float(tilt))
+                    ):
+                        errors.append(
+                            f"{sample_id}: measurement subsets require finite camera.tilt_deg"
+                        )
+                    else:
+                        tilt_value = float(tilt)
+                        if "measurement-top25" in subset_set and tilt_value > 25.0:
+                            errors.append(
+                                f"{sample_id}: measurement-top25 exceeds 25 degrees"
+                            )
+                        if "measurement-top35" in subset_set and tilt_value > 35.0:
+                            errors.append(
+                                f"{sample_id}: measurement-top35 exceeds 35 degrees"
+                            )
 
     sample_only_total = sum(sample_only_eval_counts.values())
     if sample_only_total:

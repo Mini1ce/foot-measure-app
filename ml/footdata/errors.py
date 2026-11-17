@@ -15,3 +15,5 @@ class ManifestError(FootDataError):
 
 class SplitError(FootDataError):
     """A leakage-safe split cannot be produced."""
+
+

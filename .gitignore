@@ -20,6 +20,7 @@ __pycache__/
 /ml/artifacts/
 /ml/data/raw/
 /ml/data/processed/
+/ml/data/packages/
 
 # next.js
 /.next/

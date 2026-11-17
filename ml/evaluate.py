@@ -11,8 +11,14 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from footseg.data import load_manifest_records
-from footseg.geometry import binary_mask_metrics, mask_dimensions
+from footseg.data import binarize_raw_mask, load_manifest_records
+from footseg.geometry import (
+    GEOMETRY_METHOD,
+    axis_angle_error_degrees,
+    binary_mask_metrics,
+    boundary_f1_score,
+    mask_dimensions,
+)
 from footseg.losses import custom_objects
 from footseg.model import infer_image_size, validate_image_size
 from footseg.preprocessing import letterbox
@@ -37,6 +43,25 @@ def parse_args() -> argparse.Namespace:
         help=f"Comma-separated thresholds (validation default: {DEFAULT_THRESHOLDS})",
     )
     parser.add_argument("--views", nargs="*")
+    parser.add_argument(
+        "--split-field",
+        choices=("split", "pretrain_split"),
+        default="split",
+        help="Manifest field used for split selection",
+    )
+    parser.add_argument("--subsets", nargs="*", help="Optional manifest subset tags")
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        help="Deterministically cap matching evaluation samples",
+    )
+    parser.add_argument("--seed", type=int, default=20260822)
+    parser.add_argument(
+        "--boundary-tolerance-px",
+        type=int,
+        default=2,
+        help="Boundary F1 tolerance at model resolution",
+    )
     return parser.parse_args()
 
 
@@ -120,8 +145,10 @@ def summarize_threshold(
         "iou",
         "precision",
         "recall",
+        "boundary_f1",
         "length_error_percent",
         "width_error_percent",
+        "angle_error_degrees",
     )
     summary: dict[str, float | int | None] = {
         "threshold": threshold,
@@ -130,17 +157,31 @@ def summarize_threshold(
     for key in numeric_keys:
         values = _finite_values(rows, key)
         summary[f"mean_{key}"] = float(np.mean(values)) if values.size else None
+        summary[f"median_{key}"] = float(np.median(values)) if values.size else None
+        summary[f"p05_{key}"] = float(np.percentile(values, 5)) if values.size else None
+        summary[f"p90_{key}"] = float(np.percentile(values, 90)) if values.size else None
         summary[f"p95_{key}"] = float(np.percentile(values, 95)) if values.size else None
 
+    eligible_geometry = sum(bool(row.get("target_geometry_eligible", True)) for row in rows)
+    excluded_geometry = len(rows) - eligible_geometry
     valid_geometry = sum(
-        _is_finite(row.get("length_error_percent"))
+        bool(row.get("target_geometry_eligible", True))
+        and bool(
+            row.get(
+                "prediction_geometry_valid",
+                _is_finite(row.get("length_error_percent")),
+            )
+        )
+        and _is_finite(row.get("length_error_percent"))
         and _is_finite(row.get("width_error_percent"))
         for row in rows
     )
-    failures = len(rows) - valid_geometry
+    failures = eligible_geometry - valid_geometry
+    summary["target_geometry_eligible_samples"] = eligible_geometry
+    summary["target_geometry_excluded_samples"] = excluded_geometry
     summary["geometry_valid_samples"] = valid_geometry
     summary["geometry_failure_samples"] = failures
-    summary["geometry_failure_rate"] = failures / len(rows) if rows else 1.0
+    summary["geometry_failure_rate"] = failures / eligible_geometry if eligible_geometry else 1.0
     summary["selection_score"] = selection_score(summary)
     return summary
 
@@ -152,6 +193,10 @@ def main() -> int:
         requested_image_size = (
             validate_image_size(args.image_size) if args.image_size is not None else None
         )
+        if args.max_samples is not None and args.max_samples <= 0:
+            raise ValueError("--max-samples must be a positive integer")
+        if args.boundary_tolerance_px < 0:
+            raise ValueError("--boundary-tolerance-px must be non-negative")
     except ValueError as error:
         raise SystemExit(str(error)) from error
     try:
@@ -165,6 +210,10 @@ def main() -> int:
         args.manifest,
         args.split,
         views=set(args.views) if args.views else None,
+        subsets=set(args.subsets) if args.subsets else None,
+        max_samples=args.max_samples,
+        sample_seed=args.seed,
+        split_field=args.split_field,
     )
     if not records:
         raise SystemExit("No records matched the evaluation filters")
@@ -189,7 +238,9 @@ def main() -> int:
 
     for index, record in enumerate(records, start=1):
         image = np.asarray(Image.open(record["image_path"]).convert("RGB"))
-        target = np.asarray(Image.open(record["mask_path"]).convert("L")) > 0
+        target = binarize_raw_mask(
+            np.asarray(Image.open(record["mask_path"]).convert("L"))
+        )
         model_image = letterbox(image, image_size, mask=False).astype(np.float32)
         model_target = letterbox(
             target.astype(np.uint8) * 255, image_size, mask=True
@@ -208,13 +259,29 @@ def main() -> int:
         for threshold in thresholds:
             prediction = probabilities >= threshold
             metrics = binary_mask_metrics(prediction, model_target)
+            metrics["boundary_f1"] = boundary_f1_score(
+                prediction,
+                model_target,
+                tolerance_px=args.boundary_tolerance_px,
+            )
             predicted_dimensions = mask_dimensions(prediction)
             row: dict[str, object] = {
                 "sample_id": record.get("sample_id", str(index)),
                 "threshold": threshold,
                 **metrics,
+                "target_geometry_eligible": target_dimensions is not None,
+                "prediction_geometry_valid": predicted_dimensions is not None,
+                "target_length_px": target_dimensions.length_px if target_dimensions else None,
+                "target_width_px": target_dimensions.width_px if target_dimensions else None,
+                "target_geometry_confidence": target_dimensions.confidence if target_dimensions else None,
+                "predicted_length_px": predicted_dimensions.length_px if predicted_dimensions else None,
+                "predicted_width_px": predicted_dimensions.width_px if predicted_dimensions else None,
+                "predicted_geometry_confidence": predicted_dimensions.confidence if predicted_dimensions else None,
+                "target_width_position": target_dimensions.width_position if target_dimensions else None,
+                "predicted_width_position": predicted_dimensions.width_position if predicted_dimensions else None,
                 "length_error_percent": None,
                 "width_error_percent": None,
+                "angle_error_degrees": None,
             }
             if predicted_dimensions and target_dimensions:
                 row["length_error_percent"] = percent_error(
@@ -222,6 +289,10 @@ def main() -> int:
                 )
                 row["width_error_percent"] = percent_error(
                     predicted_dimensions.width_px, target_dimensions.width_px
+                )
+                row["angle_error_degrees"] = axis_angle_error_degrees(
+                    predicted_dimensions.angle_rad,
+                    target_dimensions.angle_rad,
                 )
             per_threshold[threshold].append(row)
 
@@ -241,6 +312,15 @@ def main() -> int:
         "split": args.split,
         "model": str(args.model.resolve()),
         "image_size": image_size,
+        "boundary_tolerance_px": args.boundary_tolerance_px,
+        "geometry_method": GEOMETRY_METHOD,
+        "filters": {
+            "views": sorted(args.views) if args.views else None,
+            "subsets": sorted(args.subsets) if args.subsets else None,
+            "max_samples": args.max_samples,
+            "seed": args.seed,
+            "split_field": args.split_field,
+        },
         "summaries": summaries,
         "selected": best,
     }

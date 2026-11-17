@@ -22,6 +22,10 @@ measurement accuracy.
   evaluation, and release limitations.
 - Native Windows GPU training is not configured on this machine; use Python
   3.11 in WSL2 or Google Colab for future training runs.
+- SynFoot V2 RGB, mask, and label assets are extracted under
+  `ml/data/raw/Synfoot/`. The V2 tooling indexes those files in place and does
+  not create another roughly 62 GB normalized copy. Raw antialiased masks use
+  the explicit `>=128` foreground contract in import, training, and evaluation.
 
 The raw and processed datasets are intentionally ignored by Git. The manifest
 and lock inside the processed directory record every normalized asset hash,
@@ -97,6 +101,102 @@ python -m ml.footdata import synfoot-v1 `
 Do not use `--accept-license` until the terms bundled with that archive have
 actually been reviewed and accepted.
 
+### SynFoot V2 in-place workflow
+
+The local V2 release uses nested `rgb/rgb`, `mask/mask`, and
+`labels/labels_processed` directories. Index it in place after reviewing the
+publisher terms:
+
+```powershell
+python -m ml.footdata import synfoot-v2 `
+  --input-dir ml/data/raw/Synfoot `
+  --output-root ml/data/raw/Synfoot `
+  --in-place `
+  --accept-license
+
+python -m ml.footdata validate `
+  ml/data/raw/Synfoot/samples.jsonl `
+  --data-root ml/data/raw/Synfoot
+```
+
+`--verify-hashes` can be added for a full asset audit, but it deliberately
+re-reads every source file. The importer already records SHA-256 for each RGB,
+mask, and label while indexing.
+
+Create a separate grouped synthetic pretraining split. This keeps the main
+`split` train-only for all synthetic records while assigning whole `foot-id`
+groups to `pretrain_split` (six train and two validation groups for this
+eight-scan release). Exact duplicate RGB records are excluded from pretraining
+so identical pixels cannot cross the synthetic train/validation boundary:
+
+```powershell
+python -m ml.footdata pretrain-split `
+  ml/data/raw/Synfoot/samples.jsonl `
+  --output ml/data/raw/Synfoot/samples.pretrain.jsonl `
+  --lock ml/data/raw/Synfoot/pretrain.lock.json
+
+python -m ml.footdata summarize `
+  ml/data/raw/Synfoot/samples.pretrain.jsonl
+```
+
+Build upload-friendly ZIP shards containing a deterministic camera-top-view
+subset instead of uploading all 62 GB. Defaults are 12,000 training images,
+2,000 validation images, masks and labels, with approximately 2 GiB per shard:
+
+```powershell
+python -m ml.footdata package-pretrain `
+  ml/data/raw/Synfoot/samples.pretrain.jsonl `
+  --output-dir ml/data/packages/synfoot-v2 `
+  --subset measurement-top35 `
+  --train-limit 12000 `
+  --validation-limit 2000 `
+  --shard-gib 2
+```
+
+Packaging validates the grouped manifest and re-checks every selected RGB,
+mask, and label SHA-256 before writing a shard. A changed source asset therefore
+fails the command instead of being silently included under stale provenance.
+
+Upload that entire output folder privately to
+`MyDrive/foot-measure-training/synfoot-v2-package`, then run
+`ml/colab/SynFoot_V2_Foot_Segmentation_Training.ipynb` on a T4 runtime. The
+notebook verifies every shard, pretrains on SynFoot, fine-tunes on real
+FootNet images, reports boundary plus length/width silhouette errors, and
+exports a separate candidate TFLite model. Resume is allowed only when the
+dataset, source, arguments, and upstream-checkpoint fingerprint still matches;
+the result ZIP includes `training_provenance.json`. It does not replace the
+bundled model automatically.
+
+## Measurement-mask audit
+
+Create a visual report before further FootNet dorsal fine-tuning:
+
+```powershell
+python -m ml.footdata measurement-audit `
+  ml/data/processed/footnet/samples.dev.jsonl `
+  --data-root ml/data/processed/footnet `
+  --output-dir ml/artifacts/footnet-measurement-audit `
+  --views dorsal
+```
+
+The report shows the image/mask overlay beside the raw mask. Automatic reasons
+such as border contact, fragmentation, implausible silhouette ratio, or
+unavailable measurement geometry are triage hints only. Review every item and
+record an explicit `include` or `exclude`; do not turn an automatic suggestion
+directly into a training label.
+
+```powershell
+python -m ml.footdata measurement-filter `
+  ml/data/processed/footnet/samples.dev.jsonl `
+  --review ml/artifacts/footnet-measurement-audit/measurement-review.csv `
+  --output ml/data/processed/footnet/samples.measurement-reviewed.jsonl `
+  --lock ml/data/processed/footnet/samples.measurement-reviewed.lock.json
+```
+
+The filter refuses blank, unknown, or duplicate decisions and requires retained
+training and validation samples. Its lock pins the input manifest, review CSV,
+included sample IDs, and output manifest hashes.
+
 ## Training
 
 Use Python 3.11 in Linux/WSL2 or Colab for GPU training. Modern TensorFlow GPU
@@ -108,6 +208,10 @@ For the simplest Colab path, open
 **Run all**. It downloads and verifies the pinned FootNet archive, saves
 checkpoints to Google Drive, performs both training stages and validation-only
 threshold selection, exports TFLite, and downloads a compact result ZIP.
+
+Use `SynFoot_V2_Foot_Segmentation_Training.ipynb` instead when the local V2
+package above is ready. Keep the original FootNet-only notebook as the baseline
+needed for a fair comparison.
 
 ```bash
 python3.11 -m venv ml/.venv
@@ -148,7 +252,9 @@ python ml/evaluate.py \
 ```
 
 Do not tune a threshold on the test split. The evaluator reports mask metrics
-and length/width silhouette error at model resolution. Physical millimetre
+and heel-relative perpendicular cross-section geometry at model resolution,
+including target eligibility, prediction failures, confidence, median, and
+tail percentiles. Physical millimetre
 errors require a separate app-captured set with a verified reference card and
 measured foot dimensions.
 
